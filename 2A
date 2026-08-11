@@ -1,0 +1,938 @@
+"""
+===================================================
+  eLSI Sprint 1 - Task 2A : PID Line Following + Pick & Place
+===================================================
+
+Participant template.
+
+HOW TO RUN
+  1. Open the Task 2A scene in CoppeliaSim.
+  2. Start the bridge:   python3 bridge_v1_2a.py --eval
+  3. Run this file:      python3 task2a.py
+
+WHAT YOU IMPLEMENT
+  control_loop()  — PID controller that returns (left_speed, right_speed).
+  detect_color()  — identify the box color from RGB sensor values.
+  should_pick()   — decide when to stop and pick the box.
+  should_drop()   — decide when to drop the carried box.
+
+Everything else (connecting, receiving sensors, sending motor/pick/drop
+commands) is handled by CoppeliaClient.
+Don't edit this file except the marked TODO sections.
+You may add helper functions.
+
+SENSOR PROTOCOL  (from bridge_v1_2a.py):
+  Line sensors:  'left_corner', 'left', 'middle', 'right', 'right_corner'
+                  — float [0.0, 1.0];  higher = line detected.
+  Proximity:     'proximity'  — metres to nearest object; 1.0 = nothing in range.
+  Color sensor:  'color_r', 'color_g', 'color_b'  — float [0.0, 1.0].
+
+TASK FLOW
+  1. Robot drives the line following the PID controller.
+  2. When the robot is close to the box (proximity low), read the color,
+     stop, and send a PICK command.
+  3. Robot carries the box and continues following the line.
+  4. At the correct drop zone, send a DROP command.
+
+Team ID: [ 233 ]
+"""
+
+import time
+
+from connector import CoppeliaClient
+
+# The five line sensors, ordered left → right across the robot ([0.0, 1.0]).
+SENSOR_ORDER = ['left_corner', 'left', 'middle', 'right', 'right_corner']
+
+import time
+import csv
+import os
+import atexit
+
+# =============================================================================
+# Task 2A settings and shared variables
+# =============================================================================
+
+# Black line gives LOW readings; white floor gives HIGH readings.
+BLACK_THRESHOLD = 0.40
+STRONG_BLACK_THRESHOLD = 0.18
+
+# PID
+KP = 2.6
+KI = 0.0
+KD = 1.2
+
+BASE_SPEED = 1.15
+CARRY_SPEED = 0.90
+BRANCH_SPEED = 0.68
+
+MAX_SPEED = 2.00
+MIN_SPEED = -0.40
+
+# Pickup and colour detection
+PICK_DISTANCE = 0.140
+SLOW_DISTANCE = 0.25
+COLOR_READ_DISTANCE = 0.18
+
+COLOR_THRESHOLD = 0.005
+COLOR_MARGIN = 0.002
+
+# First node
+NORMAL_LINE_CONFIRM_TIME = 0.30
+NODE_CONFIRM_TIME = 0.08
+
+NODE_CENTRE_TIMEOUT = 1.50
+NODE_FORWARD_SPEED = 0.55
+
+# Existing turning logic
+TURN_SPEED = 0.52
+TURN_MIN_TIME = 0.35
+TURN_TIMEOUT = 2.50
+
+BLUE_FORWARD_SPEED = 0.60
+BLUE_TIMEOUT = 2.50
+
+# Destination detection
+DESTINATION_IGNORE_TIME = 0.80
+BRANCH_CONFIRM_TIME = 0.25
+
+# Destination marker can pass quickly, so accept three black sensors.
+DESTINATION_SENSOR_COUNT = 3
+DESTINATION_CONFIRM_TIME = 0.02
+
+# PID memory
+previous_error = 0.0
+integral_error = 0.0
+last_position = 0.0
+
+# Box state
+detected_box_color = None
+locked_box_color = None
+
+pick_requested = False
+pickup_time = 0.0
+
+# Robot states
+STATE_SEARCH_BOX = "SEARCH_BOX"
+STATE_FOLLOW_MAIN = "FOLLOW_MAIN"
+STATE_WAIT_FIRST_NODE = "WAIT_FIRST_NODE"
+STATE_ENTER_NODE = "ENTER_NODE"
+STATE_TURN = "TURN"
+STATE_FOLLOW_BRANCH = "FOLLOW_BRANCH"
+STATE_WAIT_DESTINATION = "WAIT_DESTINATION"
+STATE_FINISHED = "FINISHED"
+
+robot_state = STATE_SEARCH_BOX
+
+# Timing/state memory
+normal_line_start = None
+first_node_start = None
+
+node_entry_start = 0.0
+
+turn_start_time = 0.0
+turn_phase = "LEAVE_NODE"
+
+route_finished_time = 0.0
+
+branch_line_start = None
+destination_start = None
+destination_detection_armed = False
+
+drop_finished = False
+
+
+def get_line_values(sensors):
+    """Return the five line-sensor values."""
+
+    return [
+        float(sensors.get("left_corner", 1.0)),
+        float(sensors.get("left", 1.0)),
+        float(sensors.get("middle", 1.0)),
+        float(sensors.get("right", 1.0)),
+        float(sensors.get("right_corner", 1.0))
+    ]
+
+
+def get_black_sensors(values):
+    """Return True for sensors detecting black."""
+
+    return [
+        value < BLACK_THRESHOLD
+        for value in values
+    ]
+
+
+def get_line_strength(values):
+    """Convert low black readings into high line strengths."""
+
+    return [
+        max(0.0, min(1.0, 1.0 - value))
+        for value in values
+    ]
+
+
+def is_normal_line(values):
+    """One or two inner sensors detect a narrow black line."""
+
+    black = get_black_sensors(values)
+    black_count = sum(black)
+
+    return (
+        1 <= black_count <= 2
+        and (
+            black[1]
+            or black[2]
+            or black[3]
+        )
+        and not (
+            black[0]
+            and black[4]
+        )
+    )
+
+
+def is_wide_node(values):
+    """At least four sensors detect the wide black node."""
+
+    black = get_black_sensors(values)
+
+    return (
+        sum(black) >= 4
+        and black[0]
+        and black[2]
+        and black[4]
+    )
+
+
+def is_node_centre(values):
+    """All sensors are strongly over the black junction."""
+
+    return all(
+        value < STRONG_BLACK_THRESHOLD
+        for value in values
+    )
+
+
+def branch_line_found(values):
+    """Middle sensor is aligned with a narrow branch."""
+
+    black = get_black_sensors(values)
+
+    return (
+        black[2]
+        and sum(black) <= 2
+    )
+
+
+def destination_marker_found(values):
+    """
+    Detect the final marker.
+
+    Three or more sensors must see black, including at least one inner sensor.
+    This is more sensitive than first-node detection because the destination
+    marker may pass under the robot quickly.
+    """
+
+    black = get_black_sensors(values)
+    black_count = sum(black)
+
+    return (
+        black_count >= DESTINATION_SENSOR_COUNT
+        and (
+            black[1]
+            or black[2]
+            or black[3]
+        )
+    )
+
+
+def reset_pid():
+    """Reset PID history."""
+
+    global previous_error
+    global integral_error
+    global last_position
+
+    previous_error = 0.0
+    integral_error = 0.0
+    last_position = 0.0
+
+
+def pid_control(values, base_speed):
+    """Weighted-average PID for a black line on white background."""
+
+    global previous_error
+    global integral_error
+    global last_position
+
+    strengths = get_line_strength(values)
+    weights = [-2.0, -1.0, 0.0, 1.0, 2.0]
+
+    total = sum(strengths)
+
+    if total > 0.05:
+        position = sum(
+            weight * strength
+            for weight, strength in zip(weights, strengths)
+        ) / total
+
+        last_position = position
+
+    else:
+        position = last_position
+
+    error = 0.0 - position
+
+    integral_error += error
+    integral_error = max(
+        -5.0,
+        min(5.0, integral_error)
+    )
+
+    derivative = error - previous_error
+
+    correction = (
+        KP * error
+        + KI * integral_error
+        + KD * derivative
+    )
+
+    previous_error = error
+
+    dynamic_speed = base_speed - min(
+        abs(error) * 0.20,
+        0.30
+    )
+
+    left_speed = dynamic_speed - correction
+    right_speed = dynamic_speed + correction
+
+    left_speed = max(
+        MIN_SPEED,
+        min(MAX_SPEED, left_speed)
+    )
+
+    right_speed = max(
+        MIN_SPEED,
+        min(MAX_SPEED, right_speed)
+    )
+
+    return left_speed, right_speed
+
+
+def control_loop(sensors):
+    """Follow the line and execute the colour route."""
+
+    global robot_state
+    global node_entry_start
+
+    global turn_start_time
+    global turn_phase
+
+    global route_finished_time
+
+    proximity = float(
+        sensors.get("proximity", 1.0)
+    )
+
+    values = get_line_values(sensors)
+
+    black = get_black_sensors(values)
+    black_count = sum(black)
+
+    # -------------------------------------------------------------------------
+    # Approach box
+    # -------------------------------------------------------------------------
+    if robot_state == STATE_SEARCH_BOX:
+
+        if proximity < SLOW_DISTANCE:
+
+            if detected_box_color is None:
+                return 0.08, 0.08
+
+            if proximity <= PICK_DISTANCE:
+                return 0.0, 0.0
+
+            return 0.15, 0.15
+
+        return pid_control(
+            values,
+            BASE_SPEED
+        )
+
+    # -------------------------------------------------------------------------
+    # Follow main line after pickup
+    # -------------------------------------------------------------------------
+    if robot_state in (
+        STATE_FOLLOW_MAIN,
+        STATE_WAIT_FIRST_NODE
+    ):
+        return pid_control(
+            values,
+            CARRY_SPEED
+        )
+
+    # -------------------------------------------------------------------------
+    # Enter first node centre
+    # -------------------------------------------------------------------------
+    if robot_state == STATE_ENTER_NODE:
+
+        elapsed = (
+            time.monotonic()
+            - node_entry_start
+        )
+
+        if (
+            is_node_centre(values)
+            or elapsed >= NODE_CENTRE_TIMEOUT
+        ):
+            robot_state = STATE_TURN
+            turn_start_time = time.monotonic()
+            turn_phase = "LEAVE_NODE"
+
+            reset_pid()
+
+            print(
+                f"Node centre reached. "
+                f"Starting {locked_box_color} route."
+            )
+
+            return 0.0, 0.0
+
+        return (
+            NODE_FORWARD_SPEED,
+            NODE_FORWARD_SPEED
+        )
+
+    # -------------------------------------------------------------------------
+    # Existing sensor-controlled turn
+    # -------------------------------------------------------------------------
+    if robot_state == STATE_TURN:
+
+        now = time.monotonic()
+        elapsed = now - turn_start_time
+
+        # Blue -> straight
+        if locked_box_color == "blue":
+
+            if (
+                elapsed >= TURN_MIN_TIME
+                and branch_line_found(values)
+            ):
+                robot_state = STATE_FOLLOW_BRANCH
+                route_finished_time = now
+
+                reset_pid()
+
+                print(
+                    "Blue centre branch found. "
+                    "Following branch."
+                )
+
+                return (
+                    BRANCH_SPEED,
+                    BRANCH_SPEED
+                )
+
+            if elapsed >= BLUE_TIMEOUT:
+                robot_state = STATE_FOLLOW_BRANCH
+                route_finished_time = now
+
+                reset_pid()
+
+                print(
+                    "Blue route timeout. "
+                    "Starting slow branch PID."
+                )
+
+                return 0.40, 0.40
+
+            return (
+                BLUE_FORWARD_SPEED,
+                BLUE_FORWARD_SPEED
+            )
+
+        # Red -> pivot left
+        if locked_box_color == "red":
+            left_speed = -TURN_SPEED
+            right_speed = TURN_SPEED
+
+        # Green -> pivot right
+        elif locked_box_color == "green":
+            left_speed = TURN_SPEED
+            right_speed = -TURN_SPEED
+
+        else:
+            return 0.0, 0.0
+
+        # Leave wide node first.
+        if turn_phase == "LEAVE_NODE":
+
+            if (
+                elapsed >= TURN_MIN_TIME
+                and black_count <= 2
+            ):
+                turn_phase = "FIND_BRANCH"
+
+                print(
+                    "Wide node cleared. "
+                    "Searching for branch."
+                )
+
+            return (
+                left_speed,
+                right_speed
+            )
+
+        # Find branch with middle sensor.
+        if turn_phase == "FIND_BRANCH":
+
+            if branch_line_found(values):
+
+                robot_state = STATE_FOLLOW_BRANCH
+                route_finished_time = now
+
+                turn_phase = "LEAVE_NODE"
+                turn_start_time = 0.0
+
+                reset_pid()
+
+                print(
+                    f"{locked_box_color.capitalize()} "
+                    f"branch found. Turn completed."
+                )
+
+                return (
+                    BRANCH_SPEED,
+                    BRANCH_SPEED
+                )
+
+            if elapsed >= TURN_TIMEOUT:
+
+                robot_state = STATE_FOLLOW_BRANCH
+                route_finished_time = now
+
+                turn_phase = "LEAVE_NODE"
+                turn_start_time = 0.0
+
+                reset_pid()
+
+                print(
+                    "Turn timeout. "
+                    "Starting slow line recovery."
+                )
+
+                return 0.35, 0.35
+
+            return (
+                left_speed,
+                right_speed
+            )
+
+    # -------------------------------------------------------------------------
+    # Follow branch
+    # -------------------------------------------------------------------------
+    if robot_state in (
+        STATE_FOLLOW_BRANCH,
+        STATE_WAIT_DESTINATION
+    ):
+        return pid_control(
+            values,
+            BRANCH_SPEED
+        )
+
+    # -------------------------------------------------------------------------
+    # Stop after successful drop
+    # -------------------------------------------------------------------------
+    if robot_state == STATE_FINISHED:
+        return 0.0, 0.0
+
+    return 0.0, 0.0
+
+
+def detect_color(sensors):
+    """Detect red, green or blue box colour."""
+
+    global detected_box_color
+
+    proximity = float(
+        sensors.get("proximity", 1.0)
+    )
+
+    if proximity > COLOR_READ_DISTANCE:
+        return None
+
+    red = float(
+        sensors.get("color_r", 0.0)
+    )
+
+    green = float(
+        sensors.get("color_g", 0.0)
+    )
+
+    blue = float(
+        sensors.get("color_b", 0.0)
+    )
+
+    print(
+        f"Proximity={proximity:.3f}, "
+        f"RGB=({red:.3f}, "
+        f"{green:.3f}, "
+        f"{blue:.3f})"
+    )
+
+    if max(red, green, blue) < COLOR_THRESHOLD:
+        return None
+
+    if (
+        red >= green + COLOR_MARGIN
+        and red >= blue + COLOR_MARGIN
+    ):
+        detected_box_color = "red"
+
+    elif (
+        blue >= red + COLOR_MARGIN
+        and blue >= green + COLOR_MARGIN
+    ):
+        detected_box_color = "blue"
+
+    elif (
+        green >= red + COLOR_MARGIN
+        and green >= blue + COLOR_MARGIN
+    ):
+        detected_box_color = "green"
+
+    else:
+        return None
+
+    print(
+        f"Confirmed box colour: "
+        f"{detected_box_color}"
+    )
+
+    return detected_box_color
+
+
+def should_pick(sensors, carrying_box):
+    """Pick when colour is known and proximity is close."""
+
+    global pick_requested
+    global pickup_time
+    global locked_box_color
+
+    global robot_state
+
+    global normal_line_start
+    global first_node_start
+    global node_entry_start
+
+    global turn_start_time
+    global turn_phase
+
+    global route_finished_time
+
+    global branch_line_start
+    global destination_start
+    global destination_detection_armed
+
+    global drop_finished
+
+    if carrying_box or pick_requested:
+        return False
+
+    proximity = float(
+        sensors.get("proximity", 1.0)
+    )
+
+    if detected_box_color not in (
+        "red",
+        "blue",
+        "green"
+    ):
+        return False
+
+    if proximity <= PICK_DISTANCE:
+
+        pick_requested = True
+        pickup_time = time.monotonic()
+        locked_box_color = detected_box_color
+
+        robot_state = STATE_FOLLOW_MAIN
+
+        normal_line_start = None
+        first_node_start = None
+        node_entry_start = 0.0
+
+        turn_start_time = 0.0
+        turn_phase = "LEAVE_NODE"
+
+        route_finished_time = 0.0
+
+        branch_line_start = None
+        destination_start = None
+        destination_detection_armed = False
+
+        drop_finished = False
+
+        reset_pid()
+
+        print(
+            f"Box ready at "
+            f"{proximity:.3f} m. "
+            f"Locked colour="
+            f"{locked_box_color}. "
+            f"Sending PICK."
+        )
+
+        return True
+
+    return False
+
+
+def should_drop(sensors, carrying_box, detected_color):
+    """
+    PICK
+    -> follow main line
+    -> detect first wide node
+    -> enter node
+    -> route according to colour
+    -> clear first node
+    -> confirm selected narrow branch
+    -> detect next black marker
+    -> DROP
+    """
+
+    global robot_state
+
+    global normal_line_start
+    global first_node_start
+    global node_entry_start
+
+    global branch_line_start
+    global destination_start
+    global destination_detection_armed
+
+    global drop_finished
+
+    if not carrying_box or drop_finished:
+        return False
+
+    if locked_box_color not in (
+        "red",
+        "blue",
+        "green"
+    ):
+        return False
+
+    now = time.monotonic()
+
+    values = get_line_values(sensors)
+
+    normal_line = is_normal_line(values)
+    wide_node = is_wide_node(values)
+    destination_marker = destination_marker_found(values)
+
+    # -------------------------------------------------------------------------
+    # Confirm main narrow line after pickup
+    # -------------------------------------------------------------------------
+    if robot_state == STATE_FOLLOW_MAIN:
+
+        if normal_line:
+
+            if normal_line_start is None:
+                normal_line_start = now
+
+            if (
+                now - normal_line_start
+                >= NORMAL_LINE_CONFIRM_TIME
+            ):
+                robot_state = STATE_WAIT_FIRST_NODE
+                first_node_start = None
+
+                print(
+                    "Main narrow line confirmed. "
+                    "Waiting for first wide node."
+                )
+
+        else:
+            normal_line_start = None
+
+        return False
+
+    # -------------------------------------------------------------------------
+    # Detect first wide node
+    # -------------------------------------------------------------------------
+    if robot_state == STATE_WAIT_FIRST_NODE:
+
+        if wide_node:
+
+            if first_node_start is None:
+                first_node_start = now
+
+            if (
+                now - first_node_start
+                >= NODE_CONFIRM_TIME
+            ):
+                robot_state = STATE_ENTER_NODE
+
+                node_entry_start = now
+                first_node_start = None
+
+                reset_pid()
+
+                print(
+                    "First wide node confirmed. "
+                    "Moving to node centre."
+                )
+
+        else:
+            first_node_start = None
+
+        return False
+
+    # Node entry and turning are handled by control_loop().
+    if robot_state in (
+        STATE_ENTER_NODE,
+        STATE_TURN
+    ):
+        return False
+
+    # -------------------------------------------------------------------------
+    # Clear first node and confirm selected branch
+    # -------------------------------------------------------------------------
+    if robot_state == STATE_FOLLOW_BRANCH:
+
+        # Prevent first junction from being detected as destination.
+        if (
+            now - route_finished_time
+            < DESTINATION_IGNORE_TIME
+        ):
+            branch_line_start = None
+            destination_start = None
+            destination_detection_armed = False
+            return False
+
+        if not destination_detection_armed:
+
+            if normal_line:
+
+                if branch_line_start is None:
+                    branch_line_start = now
+
+                if (
+                    now - branch_line_start
+                    >= BRANCH_CONFIRM_TIME
+                ):
+                    destination_detection_armed = True
+                    destination_start = None
+
+                    robot_state = STATE_WAIT_DESTINATION
+
+                    print(
+                        "First node cleared. "
+                        "Selected branch confirmed. "
+                        "Destination detection armed."
+                    )
+
+            else:
+                branch_line_start = None
+
+            return False
+
+    # -------------------------------------------------------------------------
+    # Detect final destination marker
+    # -------------------------------------------------------------------------
+    if robot_state == STATE_WAIT_DESTINATION:
+
+        if destination_marker:
+
+            if destination_start is None:
+                destination_start = now
+
+            if (
+                now - destination_start
+                >= DESTINATION_CONFIRM_TIME
+            ):
+                destination_start = None
+                destination_detection_armed = False
+
+                drop_finished = True
+                robot_state = STATE_FINISHED
+
+                print(
+                    f"Final {locked_box_color} "
+                    f"destination marker detected. "
+                    f"Sending DROP."
+                )
+
+                return True
+
+        else:
+            destination_start = None
+
+        return False
+
+    return False
+
+
+# =============================================================================
+#  Main loop (Don't Edit this)
+# =============================================================================
+def main():
+    client = CoppeliaClient(host="127.0.0.1", port=50002)
+    client.connect()
+    print("Connected to bridge_v1_2a. Running... (Ctrl+C to stop)")
+
+    last_sensors   = None
+    carrying_box   = False
+    detected_color = None
+
+    try:
+        while True:
+            sensors = client.receive_sensor_data()
+            if sensors is not None:
+                last_sensors = sensors
+            if last_sensors is None:
+                time.sleep(0.02)
+                continue
+
+            # --- Color detection (once, before picking) ---
+            if detected_color is None and not carrying_box:
+                color = detect_color(last_sensors)
+                if color is not None:
+                    detected_color = color
+                    print(f"Color detected: {color!r}")
+
+            # --- Pick ---
+            if not carrying_box and should_pick(last_sensors, carrying_box):
+                success = client.send_pick()
+                print(f"PICK attempted  — success={success}")
+                if success:
+                    carrying_box = True
+
+            # --- Drop ---
+            if carrying_box and should_drop(last_sensors, carrying_box, detected_color):
+                success = client.send_drop()
+                print(f"DROP attempted  — success={success}")
+                if success:
+                    carrying_box = False
+
+            # --- Motor command ---
+            left, right = control_loop(last_sensors)
+            client.send_motor_command(left, right)
+
+            time.sleep(0.05)   # ~20 Hz control loop
+
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        try:
+            client.send_motor_command(0.0, 0.0)
+        except Exception:
+            pass
+        client.close()
+
+
+if __name__ == "__main__":
+    main()
