@@ -1,0 +1,293 @@
+"""
+===================================================
+    eLSI Sprint 1 - Task 1B : Q-Learning
+===================================================
+
+Team ID: [233]
+"""
+
+import time
+import os
+import pickle
+import random
+import argparse
+
+from connector_task1b import CoppeliaClient
+
+SENSOR_ORDER = ['left_corner', 'left', 'middle', 'right', 'right_corner']
+
+ACTIONS = [
+    (15.5, 15.5),
+    (8.5, 15.5),
+    (5.5, 16.0),
+    (15.5, 8.5),
+    (16.0, 5.5),
+    (3.5, 14.0),
+    (14.0, 3.5),
+]
+
+ALPHA = 0.50
+GAMMA = 0.90
+EPSILON = 0.02
+
+Q_TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "q_table.pkl")
+
+
+def get_speed_factor(elapsed):
+    if elapsed < 0.3:
+        return 0.90
+    elif elapsed < 0.8:
+        return 1.20
+    elif elapsed < 1.5:
+        return 1.40
+    else:
+        return 1.55
+
+
+def get_values(sensors):
+    raw = [sensors[name] for name in SENSOR_ORDER]
+
+    if not hasattr(get_values, "dark_line"):
+        get_values.dark_line = False
+        get_values.counter = 0
+
+    avg = sum(raw) / 5.0
+    spread = max(raw) - min(raw)
+
+    if spread > 0.20:
+        if avg > 0.55:
+            get_values.counter += 1
+        elif avg < 0.45:
+            get_values.counter -= 1
+
+    if get_values.counter >= 4:
+        get_values.dark_line = True
+        get_values.counter = 4
+    elif get_values.counter <= -4:
+        get_values.dark_line = False
+        get_values.counter = -4
+
+    if get_values.dark_line:
+        return [1.0 - v for v in raw]
+    return raw
+
+
+def get_state(sensors):
+    values = get_values(sensors)
+    weights = [-2, -1, 0, 1, 2]
+
+    total = sum(values)
+    contrast = max(values) - min(values)
+
+    if total < 0.10 or contrast < 0.08:
+        return ("lost",)
+
+    pos = sum(w * v for w, v in zip(weights, values)) / total
+
+    if pos < -0.95:
+        return ("far_left",)
+    elif pos < -0.18:
+        return ("left",)
+    elif pos <= 0.18:
+        return ("center",)
+    elif pos <= 0.95:
+        return ("right",)
+    else:
+        return ("far_right",)
+
+
+def get_reward(sensors, state):
+    if state == ("center",):
+        return 30.0
+    if state in [("left",), ("right",)]:
+        return 12.0
+    if state in [("far_left",), ("far_right",)]:
+        return 3.0
+    if state == ("lost",):
+        return -40.0
+    return -10.0
+
+
+def heuristic_action(state):
+    if state == ("center",):
+        return 0
+    if state == ("left",):
+        return 1
+    if state == ("far_left",):
+        return 2
+    if state == ("right",):
+        return 3
+    if state == ("far_right",):
+        return 4
+    return 0
+
+
+def choose_action(agent, state, training):
+    agent._ensure(state)
+    best = heuristic_action(state)
+
+    if state == ("lost",):
+        if not hasattr(choose_action, "last_side"):
+            choose_action.last_side = 1
+        return 5 if choose_action.last_side < 0 else 6
+
+    if state in [("left",), ("far_left",)]:
+        choose_action.last_side = -1
+    elif state in [("right",), ("far_right",)]:
+        choose_action.last_side = 1
+
+    if training:
+        if max(agent.q_table[state]) == 0.0:
+            agent.q_table[state][best] = 50.0
+
+        if random.random() < agent.epsilon:
+            return best
+
+        return agent.q_table[state].index(max(agent.q_table[state]))
+
+    return best
+
+
+class QLearningAgent:
+    def __init__(self, n_actions, alpha, gamma, epsilon, path):
+        self.n_actions = n_actions
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.path = path
+        self.q_table = {}
+
+    def _ensure(self, state):
+        if state not in self.q_table:
+            self.q_table[state] = [0.0] * self.n_actions
+
+    def update(self, state, action, reward, next_state):
+        self._ensure(state)
+        self._ensure(next_state)
+
+        best_next = max(self.q_table[next_state])
+        target = reward + self.gamma * best_next
+
+        self.q_table[state][action] += self.alpha * (
+            target - self.q_table[state][action]
+        )
+
+    def load(self):
+        if os.path.exists(self.path):
+            with open(self.path, "rb") as f:
+                self.q_table = pickle.load(f)
+            print(f"Loaded Q-table ({len(self.q_table)} states)")
+            return True
+        return False
+
+    def save(self):
+        with open(self.path, "wb") as f:
+            pickle.dump(self.q_table, f)
+        print(f"Saved Q-table ({len(self.q_table)} states)")
+
+
+def run(mode):
+    training = (mode == "train")
+    agent = QLearningAgent(len(ACTIONS), ALPHA, GAMMA, EPSILON, Q_TABLE_PATH)
+
+    loaded = agent.load()
+    if not training and not loaded:
+        print("ERROR: Run train mode first.")
+        return
+
+    client = CoppeliaClient(host="127.0.0.1", port=50002)
+    client.connect()
+    print(f"Connected to bridge_task1b. Mode = {mode}")
+
+    prev_state = None
+    prev_action = None
+    start_time = time.time()
+    none_count = 0
+
+    try:
+        while True:
+            sensors = client.receive_sensor_data()
+
+            if sensors is None:
+                none_count += 1
+
+                if none_count >= 3:
+                    print("Finish reached or bridge closed. Program stopped safely.")
+                    break
+
+                time.sleep(0.05)
+                continue
+
+            none_count = 0
+
+            state = get_state(sensors)
+            reward = get_reward(sensors, state)
+
+            if training and prev_state is not None:
+                agent.update(prev_state, prev_action, reward, state)
+
+            action = choose_action(agent, state, training)
+            left, right = ACTIONS[action]
+
+            elapsed = time.time() - start_time
+            speed_factor = get_speed_factor(elapsed)
+
+            if state in [("left",), ("right",)]:
+                speed_factor *= 0.95
+            elif state in [("far_left",), ("far_right",)]:
+                speed_factor *= 0.90
+            elif state == ("lost",):
+                speed_factor *= 0.70
+
+            left *= speed_factor
+            right *= speed_factor
+
+            try:
+                client.send_motor_command(
+                    left,
+                    right,
+                    state=list(state),
+                    reward=reward,
+                    action=action
+                )
+            except Exception:
+                print("Bridge connection closed while sending command.")
+                break
+
+            prev_state = state
+            prev_action = action
+
+            time.sleep(0.055)
+
+    except KeyboardInterrupt:
+        print("\nStopping...")
+
+    finally:
+        try:
+            client.send_motor_command(0.0, 0.0, state=0, reward=0.0, action=0)
+        except Exception:
+            pass
+
+        try:
+            client.close()
+        except Exception:
+            pass
+
+        if training:
+            agent.save()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Task 1B - Q-Learning")
+    parser.add_argument(
+        "--mode",
+        choices=["train", "test"],
+        default="train",
+        help="train: explore + update Q-table; test: greedy, no update"
+    )
+    args = parser.parse_args()
+    run(args.mode)
+
+
+if __name__ == "__main__":
+    main()
