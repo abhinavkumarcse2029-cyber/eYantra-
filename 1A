@@ -1,0 +1,210 @@
+"""
+===================================================
+    eLSI Sprint 1 - Task 1A : PID Line Following
+===================================================
+
+
+Team ID: [ 233 ]
+"""
+
+import time
+
+from connector_task1a import CoppeliaClient
+
+# The five line sensors, ordered left -> right across the robot.
+# Each value is in [0.0, 1.0]; a higher value means the line is detected.
+SENSOR_ORDER = ['left_corner', 'left', 'middle', 'right', 'right_corner']
+
+SWITCH_THRESHOLD = 0.60
+SWITCH_FRAMES = 5
+
+
+def control_loop(sensors):
+    """Return (left_speed, right_speed) for the current sensor reading.
+
+    `sensors` is a dict, e.g.:
+        {'left_corner': 0.02, 'left': 0.41, 'middle': 0.95,
+         'right': 0.05, 'right_corner': 0.01}
+
+    ------------------------------------------------------------------
+    TODO (participants): implement your PID line-following controller.
+    ------------------------------------------------------------------
+    A typical approach:
+      1. Turn the 5 readings into ONE line-position error
+      2. Feed that error through a PID controller:
+      3. Drive the wheels differentially:
+    """
+
+    # Initialize PID variables only once
+    if not hasattr(control_loop, "previous_error"):
+        control_loop.previous_error = 0.0
+        control_loop.integral = 0.0
+        control_loop.smooth_error = 0.0
+        control_loop.smooth_pid = 0.0
+        control_loop.last_seen_side = 0
+        control_loop.is_dark_line = False
+        control_loop.switched = False
+        control_loop.switch_count = 0
+        control_loop.frame_num = 0
+
+    # Count processed frames
+    control_loop.frame_num += 1
+
+    # Sensor weights for line position calculation
+    weights = [-2, -1, 0, 1, 2]
+
+    # Read current sensor values
+    values = [
+        sensors['left_corner'],
+        sensors['left'],
+        sensors['middle'],
+        sensors['right'],
+        sensors['right_corner'],
+    ]
+
+    # Average sensor value for background switching
+    avg_val = sum(values) / 5.0
+
+    # Detect transition from first track to second track
+    if not control_loop.switched and control_loop.frame_num > 30:
+        if avg_val >= SWITCH_THRESHOLD:
+            control_loop.switch_count += 1
+            if control_loop.switch_count >= SWITCH_FRAMES:
+                control_loop.is_dark_line = True
+                control_loop.switched = True
+                control_loop.smooth_error = 0.0
+                control_loop.smooth_pid = 0.0
+                control_loop.integral = 0.0
+                control_loop.previous_error = 0.0
+        else:
+            control_loop.switch_count = 0
+
+    # Invert sensor values after background changes
+    if control_loop.is_dark_line:
+        line_signal = [1.0 - v for v in values]
+    else:
+        line_signal = list(values)
+
+    # Calculate line contrast
+    contrast = max(line_signal) - min(line_signal)
+    total = sum(line_signal)
+
+    # Remember last detected side for recovery
+    max_idx = line_signal.index(max(line_signal))
+
+    if max(line_signal) > 0.35:
+        if max_idx < 2:
+            control_loop.last_seen_side = -1
+        elif max_idx > 2:
+            control_loop.last_seen_side = 1
+        else:
+            control_loop.last_seen_side = 0
+
+    # Recovery when line is temporarily lost
+    if contrast < 0.18 or total < 0.12:
+        if control_loop.last_seen_side < 0:
+            return 5.0, 20.0
+        elif control_loop.last_seen_side > 0:
+            return 20.0, 5.0
+        else:
+            return 14.0, 14.0
+
+    # Weighted average line position
+    position = sum(w * v for w, v in zip(weights, line_signal)) / total
+
+    # Position error
+    error = 0.0 - position
+
+    # Ignore very small errors
+    if abs(error) < 0.05:
+        error = 0.0
+
+    # Smooth error before PID
+    alpha = 0.60 + min(abs(error), 1.0) * 0.25
+    control_loop.smooth_error = (1 - alpha) * control_loop.smooth_error + alpha * error
+    error = control_loop.smooth_error
+
+    # PID gains
+    if control_loop.is_dark_line:
+        Kp = 3.9
+        Ki = 0.0
+        Kd = 3.7
+    else:
+        Kp = 3.4
+        Ki = 0.0
+        Kd = 3.2
+
+    # Integral with anti-windup
+    control_loop.integral += error
+    control_loop.integral = max(-2.5, min(2.5, control_loop.integral))
+
+    # Calculate derivative
+    derivative = error - control_loop.previous_error
+    control_loop.previous_error = error
+
+    # PID output
+    raw_pid = (Kp * error) + (Ki * control_loop.integral) + (Kd * derivative)
+
+    # Smooth PID output
+    beta = 0.55 + min(abs(error), 1.0) * 0.20
+    control_loop.smooth_pid = (1 - beta) * control_loop.smooth_pid + beta * raw_pid
+    pid = control_loop.smooth_pid
+
+    # Slow start for stability
+    if control_loop.frame_num < 10:
+        straight_speed = 10.0
+        turn_speed = 8.0
+    else:
+        straight_speed = 32.0
+        turn_speed = 13.0
+
+    max_speed = 40.0
+
+    # Adaptive base speed
+    coeff = (straight_speed - turn_speed) / 2.8
+    base_speed = straight_speed - min(abs(error), 2.8) * coeff
+    base_speed = max(base_speed, turn_speed)
+
+    # Differential drive
+    left = base_speed - pid
+    right = base_speed + pid
+
+    # Limit motor speeds
+    left = max(0.0, min(max_speed, left))
+    right = max(0.0, min(max_speed, right))
+
+    return left, right
+
+
+def main():
+    client = CoppeliaClient(host="127.0.0.1", port=50002)
+    client.connect()
+    print("Connected to bridge_task1a. Running... (Ctrl+C to stop)")
+
+    last_sensors = None
+    try:
+        while True:
+            # Pull the freshest sensor packet; reuse the last one between packets.
+            sensors = client.receive_sensor_data()
+            if sensors is not None:
+                last_sensors = sensors
+            if last_sensors is None:
+                time.sleep(0.02)
+                continue
+
+            left, right = control_loop (last_sensors)
+            client.send_motor_command(left, right)
+
+            time.sleep(0.05)   # ~20 Hz control loop
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        try:
+            client.send_motor_command(0.0, 0.0)   # stop the robot
+        except Exception:
+            pass
+        client.close()
+
+
+if __name__ == "__main__":
+    main()
